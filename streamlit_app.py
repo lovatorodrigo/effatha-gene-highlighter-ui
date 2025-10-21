@@ -16,9 +16,22 @@ with st.sidebar:
     st.header("Upload & Opções")
     up = st.file_uploader("Laudo (PDF ou TXT)", type=["pdf","txt"], accept_multiple_files=False)
     roi = st.slider("Janela ao redor da mutação (nt)", 20, 200, 90, 10)
-    fetch_seq = st.checkbox("Baixar transcrito (NCBI)", value=True,
-                            help="Usa eutils para obter NM_* e destacar mutações na CDS")
-    ncbi_email = st.text_input("NCBI email (opcional)", value=(st.secrets.get("NCBI_TOOL_EMAIL", "") if hasattr(st, "secrets") else os.environ.get("NCBI_TOOL_EMAIL", "")))
+    fetch_seq = st.checkbox(
+        "Baixar transcrito (NCBI)", value=True,
+        help="Usa eutils para obter NM_* e destacar mutações na CDS"
+    )
+
+    # Preferir variável de ambiente (Render). Só tentar st.secrets se houver, protegendo com try/except.
+    def _default_ncbi_email() -> str:
+        env = os.environ.get("NCBI_TOOL_EMAIL")
+        if env:
+            return env
+        try:
+            return st.secrets.get("NCBI_TOOL_EMAIL", "")
+        except Exception:
+            return ""
+
+    ncbi_email = st.text_input("NCBI email (opcional)", value=_default_ncbi_email())
     go = st.button("Processar")
 
 @st.cache_data(show_spinner=False)
@@ -29,8 +42,10 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     try:
         return extract_text_from_pdf_path(temp_path)
     finally:
-        try: os.remove(temp_path)
-        except Exception: pass
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
 
 @st.cache_data(show_spinner=False)
 def _parse_text(text: str):

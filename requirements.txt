@@ -1,0 +1,6 @@
+streamlit
+pdfminer.six
+PyPDF2
+biopython
+requests
+pandas

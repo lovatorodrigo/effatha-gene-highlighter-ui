@@ -46,6 +46,7 @@ class Highlight:
 
 # ----------------- PDF/TXT parsing -----------------
 def extract_text_from_pdf_path(pdf_path: str) -> str:
+    """Extrai texto do PDF usando pdfminer.six se disponível; senão tenta PyPDF2."""
     if _pdfminer_extract_text is not None:
         return _pdfminer_extract_text(pdf_path)
     if PyPDF2 is not None:
@@ -57,6 +58,7 @@ def extract_text_from_pdf_path(pdf_path: str) -> str:
         return '\n'.join(parts)
     raise ModuleNotFoundError("Instale 'pdfminer.six' ou 'PyPDF2'.")
 
+# Padrões de extração
 _gsym = r"[A-Z0-9]{2,}"
 _nm = r"NM_\d+(?:\.\d+)?"
 _c_hgvs_pat = r"c\.[0-9_]+(?:[+-]\d+)?(?:[ACGT]>[ACGT]|del(?:[ACGT]*)?|ins[ACGT]+|dup[ACGT]*)"
@@ -83,11 +85,27 @@ _re_onco_labels = {
     "tier3": re.compile(r"\(Tier\s*3\)", re.IGNORECASE),
 }
 
+# normalizador de símbolo gênico (remove ruídos como 'tumoralNotaEP300', '2KRAS', etc.)
+def _normalize_gene_token(raw: str) -> str:
+    """
+    Limpa ruído comum de texto de PDF/OCR.
+    - remove não alfanuméricos e põe em maiúsculas
+    - corta dígitos iniciais (ex.: '2KRAS' -> 'KRAS')
+    - captura o último padrão 'LETRAS(2+)[DIGITOS(0-3)]' no fim (ex.: 'TUMORALNOTAEP300' -> 'EP300')
+    """
+    if raw is None:
+        return ""
+    up = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    up = re.sub(r"^\d+", "", up)
+    m = re.search(r"([A-Z]{2,}[0-9]{0,3})$", up)
+    return m.group(1) if m else (up or raw)
+
 def parse_report_text(text: str) -> List[Variant]:
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     blob = "\n".join(lines)
     variants: List[Variant] = []
 
+    # SNV/Indel (Oncogênicas/Tier 2)
     for m in _re_snvindel.finditer(blob):
         vaf_raw = m.group("vaf")
         vaf = float(vaf_raw.replace('%','').replace(',','.')) if vaf_raw else None
@@ -96,24 +114,47 @@ def parse_report_text(text: str) -> List[Variant]:
               "Provavelmente oncogênica" if _re_onco_labels["prob_oncogenic"].search(window) else None)
         tier = "Tier 2" if _re_onco_labels["tier2"].search(window) else None
         variants.append(Variant(
-            gene=m.group("gene"), transcript=m.group("tx"), hgvs_c=m.group("c"),
-            hgvs_p=(m.group("p") or None), vaf_pct=vaf, tier=tier, oncogenicity=onc,
-            section="oncogenic", notes=[],
+            gene=_normalize_gene_token(m.group("gene")),
+            transcript=m.group("tx"),
+            hgvs_c=m.group("c"),
+            hgvs_p=(m.group("p") or None),
+            vaf_pct=vaf,
+            tier=tier,
+            oncogenicity=onc,
+            section="oncogenic",
+            notes=[],
         ))
 
+    # CNV
     for m in _re_cnv.finditer(blob):
         variants.append(Variant(
-            gene=m.group("gene"), transcript=m.group("tx"), hgvs_c=None, hgvs_p=None,
-            vaf_pct=None, tier="Tier 2", oncogenicity="Oncogênica", section="cnv", notes=["amplificacao"],
+            gene=_normalize_gene_token(m.group("gene")),
+            transcript=m.group("tx"),
+            hgvs_c=None,
+            hgvs_p=None,
+            vaf_pct=None,
+            tier="Tier 2",
+            oncogenicity="Oncogênica",
+            section="cnv",
+            notes=["amplificacao"],
         ))
 
+    # VUS
     for m in _re_vus_block.finditer(blob):
         vaf = float(m.group("vaf").replace('%','').replace(',','.'))
         variants.append(Variant(
-            gene=m.group("gene"), transcript=m.group("tx"), hgvs_c=m.group("c"),
-            hgvs_p=(m.group("p") or None), vaf_pct=vaf, tier="Tier 3", oncogenicity="VUS", section="vus", notes=[],
+            gene=_normalize_gene_token(m.group("gene")),
+            transcript=m.group("tx"),
+            hgvs_c=m.group("c"),
+            hgvs_p=(m.group("p") or None),
+            vaf_pct=vaf,
+            tier="Tier 3",
+            oncogenicity="VUS",
+            section="vus",
+            notes=[],
         ))
 
+    # Dedup best-effort
     uniq: Dict[Tuple, Variant] = {}
     for v in variants:
         key = (v.gene, v.transcript, v.hgvs_c, v.section)
@@ -161,7 +202,11 @@ def apply_hgvs_c_to_cds(cds_seq: str, hgvs_c: str):
 
     m = _re_snv.match(hgvs_c)
     if m:
-        pos = int(m.group("pos")); alt = m.group("alt"); idx = pos - 1
+        pos = int(m.group("pos"))
+        alt = m.group("alt")
+        idx = pos - 1
+        if idx < 0 or idx >= len(s):
+            raise ValueError(f"Posição fora do CDS: {hgvs_c}")
         mutated = s[:idx] + alt + s[idx+1:]
         hs.append(Highlight(start=pos, end=pos, kind="SNV", label=hgvs_c))
         return mutated, hs
@@ -169,48 +214,109 @@ def apply_hgvs_c_to_cds(cds_seq: str, hgvs_c: str):
     m = _re_del.match(hgvs_c)
     if m:
         start = int(m.group("start")); end = int(m.group("end"))
-        if start > end: start, end = end, start
+        if start > end:
+            start, end = end, start
         mutated = s[:start-1] + s[end:]
         hs.append(Highlight(start=start, end=end, kind="DEL", label=hgvs_c))
         return mutated, hs
 
     m = _re_ins.match(hgvs_c)
     if m:
-        end = int(m.group("end")); ins = m.group("insseq").upper()
+        end = int(m.group("end"))
+        ins = m.group("insseq").upper()
         mutated = s[:end] + ins + s[end:]
         hs.append(Highlight(start=end+1, end=end+len(ins), kind="INS", label=hgvs_c))
         return mutated, hs
 
     m = _re_dup.match(hgvs_c)
     if m:
-        pos = int(m.group("pos")); dupseq = m.group("dupseq"); idx = pos
+        pos = int(m.group("pos"))
+        dupseq = m.group("dupseq")
+        idx = pos
         if dupseq:
-            mutated = s[:idx] + dupseq + s[idx:]; end = pos + len(dupseq)
+            mutated = s[:idx] + dupseq + s[idx:]
+            end = pos + len(dupseq)
         else:
-            base = s[pos-1]; mutated = s[:idx] + base + s[idx:]; end = pos
+            base = s[pos-1]
+            mutated = s[:idx] + base + s[idx:]
+            end = pos + 1  # highlight cobre a base recém-inserida
         hs.append(Highlight(start=pos+1, end=end, kind="DUP", label=hgvs_c))
         return mutated, hs
 
-    return s, [Highlight(start=1, end=1, kind="OTHER", label=f"não aplicado: {hgvs_c}")]
+    return s, [Highlight(start=1, end1 := 1, kind="OTHER", label=f"não aplicado: {hgvs_c}")]
 
 # ----------------- HTML highlight -----------------
 def escape_html(s: str) -> str:
     return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 
-def wrap_seq_with_highlights(seq: str, highlights: List[Highlight], line=90) -> str:
-    marks = sorted([(h.start, h.end, h) for h in highlights], key=lambda x: x[0])
-    html_parts, i = [], 1
-    for (start, end, h) in marks:
-        start = max(1, start); end = min(len(seq), end)
-        if i < start: html_parts.append(escape_html(seq[i-1:start-1]))
-        html_parts.append(f"<mark title='{escape_html(h.label)}'>{escape_html(seq[start-1:end])}</mark>")
-        i = end + 1
-    if i <= len(seq): html_parts.append(escape_html(seq[i-1:]))
-    merged = ''.join(html_parts)
-    out, count, buf = [], 0, []
-    for ch in merged:
-        buf.append(ch)
-        if ch != '<': count += 1
-        if count >= line and ch not in ('<','>'):
-            buf.append('<br>'); count = 0
-    return ''.join(buf)
+def wrap_seq_with_highlights(seq: str, highlights: List[Highlight], line: int = 90) -> str:
+    """
+    Renderiza a sequência com <mark> sem inserir <br> dentro de tags.
+    Fazemos a quebra por largura apenas sobre o texto visível, emitindo <br> entre segmentos.
+    """
+    n = len(seq)
+    if n == 0:
+        return ""
+
+    # Normaliza/clampa destaques
+    norm: List[Tuple[int, int, str]] = []
+    for h in (highlights or []):
+        s = max(1, min(n, h.start))
+        e = max(1, min(n, h.end))
+        if s > e:
+            s, e = e, s
+        norm.append((s, e, h.label))
+
+    # Pontos de corte dos segmentos
+    cuts = {1, n + 1}
+    for s0, e0, _ in norm:
+        cuts.add(s0)
+        cuts.add(e0 + 1)
+    cuts = sorted(cuts)
+
+    # Para cada segmento, se está marcado e quais labels carrega
+    def labels_for(a: int, b: int) -> List[str]:
+        labs = []
+        for s0, e0, lab in norm:
+            if not (e0 < a or s0 > b):
+                if lab not in labs:
+                    labs.append(lab)
+        return labs
+
+    segments: List[Tuple[int, int, bool, str]] = []
+    for i in range(len(cuts) - 1):
+        a, b = cuts[i], cuts[i + 1] - 1
+        if a > b:
+            continue
+        labs = labels_for(a, b)
+        segments.append((a, b, len(labs) > 0, ", ".join(labs)))
+
+    # Emite HTML por linhas (line width), sem quebrar tags
+    out: List[str] = []
+    col = 0
+    pos = 1  # 1-based
+
+    while pos <= n:
+        line_end = min(n, pos + (line - col) - 1)
+
+        # Emite todos os segmentos que tocam esta janela
+        for (a, b, marked, lab) in segments:
+            if b < pos:
+                continue
+            if a > line_end:
+                break
+            s0 = max(a, pos)
+            e0 = min(b, line_end)
+            frag = escape_html(seq[s0 - 1:e0])
+            if marked:
+                out.append(f'<mark title="{escape_html(lab)}">{frag}</mark>')
+            else:
+                out.append(frag)
+
+        col += (line_end - pos + 1)
+        pos = line_end + 1
+        if pos <= n:
+            out.append("<br>")
+            col = 0
+
+    return "".join(out)

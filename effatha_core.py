@@ -243,7 +243,7 @@ def apply_hgvs_c_to_cds(cds_seq: str, hgvs_c: str):
         hs.append(Highlight(start=pos+1, end=end, kind="DUP", label=hgvs_c))
         return mutated, hs
 
-    return s, [Highlight(start=1, end1 := 1, kind="OTHER", label=f"não aplicado: {hgvs_c}")]
+    return s, [Highlight(start=1, end=1, kind="OTHER", label=f"não aplicado: {hgvs_c}")]
 
 # ----------------- HTML highlight -----------------
 def escape_html(s: str) -> str:

@@ -21,7 +21,7 @@ def _init_state():
     SS.setdefault("parsed_text", None)
     SS.setdefault("variants", None)            # list[Variant]
     SS.setdefault("df_variants", None)         # pd.DataFrame (sem HTML)
-    SS.setdefault("df_variants_html", None)    # pd.DataFrame (HGVS c. com <mark>)
+    SS.setdefault("df_variants_html", None)    # pd.DataFrame (ROI WT/MUT com <mark>)
     SS.setdefault("tx_by_gene", {})            # dict[str, TranscriptSeq]
     SS.setdefault("roi_left", 90)              # nt antes
     SS.setdefault("roi_right", 90)             # nt depois
@@ -39,13 +39,11 @@ with st.sidebar:
         up = st.file_uploader("Laudo (PDF ou TXT)", type=["pdf","txt"], accept_multiple_files=False, key="uploader")
 
         # ROI configurável (antes/depois)
-        left_default = SS.get("roi_left", 90)
-        right_default = SS.get("roi_right", 90)
         col_l, col_r = st.columns(2)
         with col_l:
-            roi_left = st.number_input("nt ANTES (à esquerda)", min_value=1, max_value=100000, value=left_default, step=1, key="roi_left_input")
+            roi_left = st.number_input("nt ANTES (à esquerda)", min_value=1, max_value=100000, value=SS.get("roi_left", 90), step=1, key="roi_left_input")
         with col_r:
-            roi_right = st.number_input("nt DEPOIS (à direita)", min_value=1, max_value=100000, value=right_default, step=1, key="roi_right_input")
+            roi_right = st.number_input("nt DEPOIS (à direita)", min_value=1, max_value=100000, value=SS.get("roi_right", 90), step=1, key="roi_right_input")
 
         fetch_seq = st.checkbox(
             "Baixar transcrito (NCBI)", value=True,
@@ -83,55 +81,133 @@ def _fetch_tx(nm: str, email: str | None):
     return parse_gb_to_transcript(gb)
 
 # -------------- helpers de ROI/arquivos --------------
-_snv_re = re.compile(r"^c\.(\d+)[ACGT]>\w", re.IGNORECASE)
-_del_re = re.compile(r"^c\.(\d+)_(\d+)del", re.IGNORECASE)
-_ins_re = re.compile(r"^c\.(\d+)_(\d+)ins", re.IGNORECASE)
-_dup_re = re.compile(r"^c\.(\d+)dup", re.IGNORECASE)
+# Padrões HGVS (para decidir como marcar nos ROIs)
+_hgvs_snv = re.compile(r"^c\.(?P<pos>\d+)(?P<ref>[ACGT])>(?P<alt>[ACGT])$", re.IGNORECASE)
+_hgvs_del = re.compile(r"^c\.(?P<s>\d+)_(?P<e>\d+)del(?P<seq>[ACGT]*)$", re.IGNORECASE)
+_hgvs_ins = re.compile(r"^c\.(?P<s>\d+)_(?P<e>\d+)ins(?P<seq>[ACGT]+)$", re.IGNORECASE)
+_hgvs_dup = re.compile(r"^c\.(?P<pos>\d+)dup(?P<seq>[ACGT]*)$", re.IGNORECASE)
+
+# Âncora no WT para centralizar ROI
+_snv_anchor = re.compile(r"^c\.(\d+)[ACGT]>\w", re.IGNORECASE)
+_del_anchor = re.compile(r"^c\.(\d+)_(\d+)del", re.IGNORECASE)
+_ins_anchor = re.compile(r"^c\.(\d+)_(\d+)ins", re.IGNORECASE)
+_dup_anchor = re.compile(r"^c\.(\d+)dup", re.IGNORECASE)
 
 def _hgvs_anchor_wt(hgvs_c: str | None) -> int | None:
     """Âncora (posição CDS 1-based) no WT para centralizar ROI."""
-    if not hgvs_c:
-        return None
-    m = _snv_re.match(hgvs_c)
+    if not hgvs_c: return None
+    m = _snv_anchor.match(hgvs_c)
     if m: return int(m.group(1))
-    m = _del_re.match(hgvs_c)
+    m = _del_anchor.match(hgvs_c)
     if m: return int(m.group(1))  # início do del
-    m = _ins_re.match(hgvs_c)
+    m = _ins_anchor.match(hgvs_c)
     if m: return int(m.group(2))  # inserção após 'end'
-    m = _dup_re.match(hgvs_c)
-    if m: return int(m.group(1))  # duplicação da base em 'pos'
+    m = _dup_anchor.match(hgvs_c)
+    if m: return int(m.group(1))  # posição da duplicação
     return None
 
-def _compute_roi_sequences(v: Variant, tx: TranscriptSeq | None, left: int, right: int) -> tuple[str, str]:
+def _roi_slice(seq: str, center: int, left: int, right: int) -> tuple[str, int, int]:
     """
-    Retorna (ROI_WT, ROI_MUT). Strings sem quebras.
-    Vazio para CNV/intrônica/splice ou quando não há transcrito.
+    Retorna (roi_seq, roi_start_idx, roi_end_idx) em coordenadas CDS 1-based.
+    roi_start_idx/roi_end_idx são os limites em CDS abrangidos pelo ROI.
+    """
+    if not seq: return "", 1, 0
+    s = max(1, center - left)
+    e = min(len(seq), center + right)
+    return seq[s-1:e], s, e
+
+def _mark_span(seq: str, a: int | None, b: int | None) -> str:
+    """Aplica <mark> no intervalo [a,b] 1-based relativo à string seq (sem HTML)."""
+    if not seq or a is None or b is None:
+        return escape_html(seq)
+    a = max(1, a); b = min(len(seq), b)
+    if a > b:
+        return escape_html(seq)
+    # Particiona e escapa
+    pre = escape_html(seq[:a-1])
+    mid = escape_html(seq[a-1:b])
+    pos = escape_html(seq[b:])
+    return f"{pre}<mark>{mid}</mark>{pos}"
+
+def _compute_roi_and_marks(v: Variant, tx: TranscriptSeq | None, left: int, right: int) -> tuple[str, str, tuple[int|None,int|None], tuple[int|None,int|None]]:
+    """
+    Retorna:
+      roi_wt, roi_mut, (wt_a, wt_b), (mut_a, mut_b)
+    onde wt_a/b e mut_a/b são coordenadas 1-based relativas ao ROI (não à CDS).
     """
     if tx is None or not v.hgvs_c:
-        return "", ""
+        return "", "", (None, None), (None, None)
     # intrônica/splice: sem posição CDS
     if "+" in v.hgvs_c or "-" in v.hgvs_c:
-        return "", ""
-    try:
-        # MUTADO
-        mut_seq, hlist = apply_hgvs_c_to_cds(tx.cds_seq, v.hgvs_c)
-        if not hlist:
-            return "", ""
-        center_mut = hlist[0].start
-        s_mut = max(1, center_mut - left)
-        e_mut = min(len(mut_seq), center_mut + right)
-        roi_mut = mut_seq[s_mut-1:e_mut]
+        return "", "", (None, None), (None, None)
 
-        # WT usando âncora derivada do HGVS
-        center_wt = _hgvs_anchor_wt(v.hgvs_c)
-        if center_wt is None:
-            center_wt = min(center_mut, len(tx.cds_seq))
-        s_wt = max(1, center_wt - left)
-        e_wt = min(len(tx.cds_seq), center_wt + right)
-        roi_wt = tx.cds_seq[s_wt-1:e_wt]
-        return roi_wt, roi_mut
-    except Exception:
-        return "", ""
+    # MUTADO
+    mut_seq, hlist = apply_hgvs_c_to_cds(tx.cds_seq, v.hgvs_c)
+    if not hlist:
+        return "", "", (None, None), (None, None)
+
+    # Centro para MUT é o início do primeiro highlight na CDS mutada
+    center_mut = hlist[0].start
+    roi_mut, mut_roi_s, mut_roi_e = _roi_slice(mut_seq, center_mut, left, right)
+
+    # Centro para WT via âncora; caso falhe, usa center_mut como aproximação
+    center_wt = _hgvs_anchor_wt(v.hgvs_c) or min(center_mut, len(tx.cds_seq))
+    roi_wt, wt_roi_s, wt_roi_e = _roi_slice(tx.cds_seq, center_wt, left, right)
+
+    # Decidir como marcar conforme HGVS
+    hg = v.hgvs_c
+
+    # SNV
+    m = _hgvs_snv.match(hg)
+    if m:
+        pos = int(m.group("pos"))
+        # WT: marca 1 nt na posição pos
+        wt_a = wt_b = pos - wt_roi_s + 1
+        # MUT: marca 1 nt na mesma posição (após troca)
+        mut_a = mut_b = pos - mut_roi_s + 1
+        return roi_wt, roi_mut, (wt_a, wt_b), (mut_a, mut_b)
+
+    # DEL
+    m = _hgvs_del.match(hg)
+    if m:
+        s_del = int(m.group("s")); e_del = int(m.group("e"))
+        if s_del > e_del: s_del, e_del = e_del, s_del
+        # WT: marca toda a região deletada
+        wt_a = s_del - wt_roi_s + 1
+        wt_b = e_del - wt_roi_s + 1
+        # MUT: marca a junção (1 nt) no início da deleção
+        mut_anchor = s_del
+        mut_a = mut_b = mut_anchor - mut_roi_s + 1
+        return roi_wt, roi_mut, (wt_a, wt_b), (mut_a, mut_b)
+
+    # INS
+    m = _hgvs_ins.match(hg)
+    if m:
+        s_ins = int(m.group("s")); e_ins = int(m.group("e"))
+        ins_seq = m.group("seq").upper()
+        L = len(ins_seq)
+        # WT: marca o ponto de inserção (um nt na posição e_ins)
+        wt_a = wt_b = e_ins - wt_roi_s + 1
+        # MUT: marca o bloco inserido (do e_ins+1 até e_ins+L)
+        mut_a = (e_ins + 1) - mut_roi_s + 1
+        mut_b = (e_ins + L) - mut_roi_s + 1
+        return roi_wt, roi_mut, (wt_a, wt_b), (mut_a, mut_b)
+
+    # DUP
+    m = _hgvs_dup.match(hg)
+    if m:
+        pos = int(m.group("pos"))
+        dupseq = (m.group("seq") or "").upper()
+        L = len(dupseq) if dupseq else 1
+        # WT: marca 1 nt no local (pos)
+        wt_a = wt_b = pos - wt_roi_s + 1
+        # MUT: marca o bloco duplicado inserido (pos+1 .. pos+L)
+        mut_a = (pos + 1) - mut_roi_s + 1
+        mut_b = (pos + L) - mut_roi_s + 1
+        return roi_wt, roi_mut, (wt_a, wt_b), (mut_a, mut_b)
+
+    # fallback
+    return roi_wt, roi_mut, (None, None), (None, None)
 
 def _roi_fasta_header(gene: str, tx: TranscriptSeq | None, hgvs_c: str, left: int, right: int) -> str:
     acc = tx.accession if tx else "NA"
@@ -146,57 +222,14 @@ def _group_by_gene(variants: list[Variant]) -> dict[str, list[Variant]]:
         by_gene.setdefault(v.gene, []).append(v)
     return by_gene
 
-# ---- NOVO: destacar nt na coluna HGVS c. (HTML) ----
-_cell_snv = re.compile(r"^c\.(?P<pos>\d+(?:[+-]\d+)?)(?P<ref>[ACGT])>(?P<alt>[ACGT])$", re.IGNORECASE)
-_cell_del = re.compile(r"^c\.(?P<s>\d+)_(?P<e>\d+)del(?P<seq>[ACGT]*)$", re.IGNORECASE)
-_cell_ins = re.compile(r"^c\.(?P<s>\d+)_(?P<e>\d+)ins(?P<seq>[ACGT]+)$", re.IGNORECASE)
-_cell_dup = re.compile(r"^c\.(?P<pos>\d+)dup(?P<seq>[ACGT]*)$", re.IGNORECASE)
-
-def _mark_hgvs_c_html(hgvs: str | None) -> str:
-    """Retorna HGVS c. com <mark> no trecho alterado, em HTML (escape seguro)."""
-    if not hgvs:
-        return "-"
-    s = hgvs.strip()
-
-    m = _cell_snv.match(s)  # inclui intrônica (pos com + ou -)
-    if m:
-        pos = escape_html(m.group("pos"))
-        ref = escape_html(m.group("ref"))
-        alt = escape_html(m.group("alt"))
-        return f"c.{pos}<mark>{ref}</mark>&gt;<mark>{alt}</mark>"
-
-    m = _cell_del.match(s)
-    if m:
-        a = escape_html(m.group("s")); b = escape_html(m.group("e"))
-        seq = m.group("seq")
-        if seq:
-            return f"c.{a}_{b}del<mark>{escape_html(seq)}</mark>"
-        return f"c.{a}_{b}<mark>del</mark>"
-
-    m = _cell_ins.match(s)
-    if m:
-        a = escape_html(m.group("s")); b = escape_html(m.group("e"))
-        seq = escape_html(m.group("seq"))
-        return f"c.{a}_{b}ins<mark>{seq}</mark>"
-
-    m = _cell_dup.match(s)
-    if m:
-        pos = escape_html(m.group("pos"))
-        seq = m.group("seq")
-        if seq:
-            return f"c.{pos}dup<mark>{escape_html(seq)}</mark>"
-        return f"c.{pos}<mark>dup</mark>"
-
-    # fallback: só escapa
-    return escape_html(s)
-
 def _build_variants_df(variants: list[Variant],
                        tx_by_gene: dict[str, TranscriptSeq],
                        left: int, right: int) -> pd.DataFrame:
+    """DF 'limpo' (sem HTML) — usado para st.dataframe e XLSX."""
     rows = []
     for v in variants:
         tx = tx_by_gene.get(v.gene)
-        roi_wt, roi_mut = _compute_roi_sequences(v, tx, left, right)
+        roi_wt, roi_mut, _, _ = _compute_roi_and_marks(v, tx, left, right)
         rows.append({
             "gene": v.gene,
             "transcrito": v.transcript,
@@ -212,13 +245,28 @@ def _build_variants_df(variants: list[Variant],
         })
     return pd.DataFrame(rows)
 
-def _build_variants_df_html(df_plain: pd.DataFrame) -> pd.DataFrame:
-    """Copia do DF com 'HGVS c.' contendo HTML com <mark> para uso no front (HTML) e relatório."""
-    df = df_plain.copy()
-    col = "HGVS c."
-    if col in df.columns:
-        df[col] = [ _mark_hgvs_c_html(x) for x in df[col].tolist() ]
-    return df
+def _build_variants_df_html(variants: list[Variant],
+                            tx_by_gene: dict[str, TranscriptSeq],
+                            left: int, right: int) -> pd.DataFrame:
+    """DF para HTML — aplica <mark> nas colunas ROI WT/MUT."""
+    rows = []
+    for v in variants:
+        tx = tx_by_gene.get(v.gene)
+        roi_wt, roi_mut, (wt_a, wt_b), (mut_a, mut_b) = _compute_roi_and_marks(v, tx, left, right)
+        rows.append({
+            "gene": escape_html(v.gene),
+            "transcrito": escape_html(v.transcript or "-"),
+            "HGVS c.": escape_html(v.hgvs_c or "-"),
+            "HGVS p.": escape_html(v.hgvs_p or "-"),
+            "VAF%": f"{v.vaf_pct:.1f}" if v.vaf_pct is not None else "",
+            "tier": escape_html(v.tier or "-"),
+            "oncogenicidade": escape_html(v.oncogenicity or "-"),
+            "seção": escape_html(v.section),
+            "notas": escape_html(", ".join(v.notes)),
+            f"ROI WT (−{left}/+{right} nt)": _mark_span(roi_wt, wt_a, wt_b),
+            f"ROI MUT (−{left}/+{right} nt)": _mark_span(roi_mut, mut_a, mut_b),
+        })
+    return pd.DataFrame(rows)
 
 def _build_html_report(df_html: pd.DataFrame,
                        grouped: dict[str, list[Variant]],
@@ -245,11 +293,11 @@ def _build_html_report(df_html: pd.DataFrame,
 
     for gene, vs in grouped.items():
         html.append(f"<h2>{escape_html(gene)}</h2>")
-        # Tabela por gene (sem destaque aqui, foco na coluna já destacada acima)
+        # Tabela por gene (sem ROI aqui; já está no resumo)
         gdf = pd.DataFrame([{
             "seção": v.section,
             "transcrito": v.transcript,
-            "HGVS c.": _mark_hgvs_c_html(v.hgvs_c),
+            "HGVS c.": v.hgvs_c,
             "HGVS p.": v.hgvs_p,
             "VAF%": v.vaf_pct,
             "tier": v.tier,
@@ -278,7 +326,7 @@ def _build_html_report(df_html: pd.DataFrame,
         for v in vs:
             if not v.hgvs_c:
                 continue
-            html.append(f"<div class='mut'><strong>{_mark_hgvs_c_html(v.hgvs_c)}</strong></div>")
+            html.append(f"<div class='mut'><strong>{escape_html(v.hgvs_c)}</strong></div>")
             if "+" in v.hgvs_c or "-" in v.hgvs_c:
                 html.append("<div class='caption'>Sem destaque CDS para variantes intrônicas/splice.</div>")
                 continue
@@ -299,7 +347,7 @@ def _build_html_report(df_html: pd.DataFrame,
     return "\n".join(html)
 
 def _build_xlsx_bytes(df_plain: pd.DataFrame) -> bytes:
-    """Gera XLSX sem HTML na coluna HGVS (mantemos a versão 'limpa' para Excel)."""
+    """Gera XLSX sem HTML — sequências WT/MUT vão como texto bruto."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         sheet = "variantes"
@@ -368,14 +416,14 @@ def _process_now(upload, left: int, right: int, fetch_flag: bool, email: str | N
                     st.info(f"Não foi possível obter {tx}: {e}")
     SS.tx_by_gene = tx_by_gene
 
-    # DF "limpo" e DF com HGVS marcado
+    # DF 'limpo' e DF para HTML (com <mark> nas ROIs)
     df_plain = _build_variants_df(variants, SS.tx_by_gene, SS.roi_left, SS.roi_right)
-    df_html = _build_variants_df_html(df_plain)
+    df_html  = _build_variants_df_html(variants, SS.tx_by_gene, SS.roi_left, SS.roi_right)
 
     SS.df_variants = df_plain
     SS.df_variants_html = df_html
 
-    # relatório HTML usa a versão com destaque; XLSX usa a versão limpa
+    # relatório HTML usa a versão com destaque nas ROIs
     SS.html_report = _build_html_report(SS.df_variants_html, grouped, SS.tx_by_gene, SS.roi_left, SS.roi_right)
     SS.xlsx_bytes = _build_xlsx_bytes(SS.df_variants)
 
@@ -392,8 +440,8 @@ if SS.processed and SS.variants is not None:
     # Tabela interativa (sem HTML)
     st.dataframe(SS.df_variants, use_container_width=True)
 
-    # Tabela com destaque (HTML)
-    st.markdown("**Tabela com destaque do nt (HGVS c.)**")
+    # Tabela com destaque nas ROIs (HTML)
+    st.markdown("**Tabela com destaque nas ROIs (WT e MUT)**")
     st.markdown(SS.df_variants_html.to_html(index=False, escape=False), unsafe_allow_html=True)
 
     # downloads do relatório/xlsx
@@ -422,7 +470,7 @@ if SS.processed and SS.variants is not None:
         st.markdown(f"### {gene}")
         tx = SS.tx_by_gene.get(gene)
 
-        # Tabela do gene — com destaque na coluna HGVS c.
+        # Tabela por gene (sem ROIs aqui — já estão na tabela resumo com destaque)
         gdf_plain = pd.DataFrame([{
             "seção": v.section,
             "transcrito": v.transcript,
@@ -433,12 +481,7 @@ if SS.processed and SS.variants is not None:
             "oncogenicidade": v.oncogenicity,
             "notas": ", ".join(v.notes),
         } for v in vs])
-        gdf_html = gdf_plain.copy()
-        if "HGVS c." in gdf_html.columns:
-            gdf_html["HGVS c."] = [ _mark_hgvs_c_html(x) for x in gdf_html["HGVS c."].tolist() ]
-
         st.dataframe(gdf_plain, use_container_width=True)
-        st.markdown(gdf_html.to_html(index=False, escape=False), unsafe_allow_html=True)
 
         if tx:
             # WT combinado
@@ -454,11 +497,11 @@ if SS.processed and SS.variants is not None:
             st.markdown("<pre>" + wrap_seq_with_highlights(tx.cds_seq, wt_highs, line=90) + "</pre>", unsafe_allow_html=True)
 
             # Por variante
-            with st.expander("Ver por variante (mutada + ROI)", expanded=False):
+            with st.expander("Ver por variante (mutada + ROI MUT para FASTA)", expanded=False):
                 for idx, v in enumerate(vs):
                     if not v.hgvs_c:
                         continue
-                    st.markdown(f"#### {_mark_hgvs_c_html(v.hgvs_c)}", unsafe_allow_html=True)
+                    st.markdown(f"#### {escape_html(v.hgvs_c)}", unsafe_allow_html=True)
                     if "+" in v.hgvs_c or "-" in v.hgvs_c:
                         st.caption("Sem destaque CDS para variantes intrônicas/splice.")
                         continue

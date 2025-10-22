@@ -1,39 +1,59 @@
-import os, tempfile
+import os, io, tempfile, base64
 import pandas as pd
 import streamlit as st
 from effatha_core import (
-    Variant, TranscriptSeq,
+    Variant, TranscriptSeq, Highlight,
     extract_text_from_pdf_path, parse_report_text,
     fetch_transcript_gb, parse_gb_to_transcript,
     apply_hgvs_c_to_cds, wrap_seq_with_highlights, escape_html
 )
 
+# ---------------- UI ----------------
 st.set_page_config(page_title="Effatha Gene Highlighter", layout="wide")
 st.title("Effatha Gene Highlighter — Streamlit")
 st.write("Suba um **PDF** do laudo (ou **TXT**), extraia variantes e visualize o **CDS** com mutações destacadas.")
 
+# -------------- helpers de estado --------------
+SS = st.session_state
+def _init_state():
+    SS.setdefault("uploaded_name", None)
+    SS.setdefault("uploaded_bytes", None)
+    SS.setdefault("parsed_text", None)
+    SS.setdefault("variants", None)           # list[Variant]
+    SS.setdefault("df_variants", None)        # pd.DataFrame
+    SS.setdefault("tx_by_gene", {})           # dict[str, TranscriptSeq]
+    SS.setdefault("roi_nt", 90)
+    SS.setdefault("html_report", None)        # str
+    SS.setdefault("xlsx_bytes", None)         # bytes
+    SS.setdefault("processed", False)
+
+_init_state()
+
+# -------------- sidebar (com forms para evitar rerun bruto) --------------
 with st.sidebar:
     st.header("Upload & Opções")
-    up = st.file_uploader("Laudo (PDF ou TXT)", type=["pdf","txt"], accept_multiple_files=False)
-    roi = st.slider("Janela ao redor da mutação (nt)", 20, 200, 90, 10)
-    fetch_seq = st.checkbox(
-        "Baixar transcrito (NCBI)", value=True,
-        help="Usa eutils para obter NM_* e destacar mutações na CDS"
-    )
 
-    # Preferir variável de ambiente (Render). Só tentar st.secrets se houver, protegendo com try/except.
-    def _default_ncbi_email() -> str:
-        env = os.environ.get("NCBI_TOOL_EMAIL")
-        if env:
-            return env
+    # Usamos um form para que o "Processar" só dispare quando submetido
+    with st.form("form_upload"):
+        up = st.file_uploader("Laudo (PDF ou TXT)", type=["pdf","txt"], accept_multiple_files=False, key="uploader")
+
+        roi = st.slider("Janela ao redor da mutação (nt)", 20, 200, SS.get("roi_nt", 90), 10, key="roi_slider")
+        fetch_seq = st.checkbox(
+            "Baixar transcrito (NCBI)", value=True,
+            help="Usa eutils para obter NM_* e destacar mutações na CDS", key="fetch_flag"
+        )
+
+        # NÃO acessar st.secrets diretamente se não existir: protegemos com try/except
         try:
-            return st.secrets.get("NCBI_TOOL_EMAIL", "")
+            default_email = st.secrets.get("NCBI_TOOL_EMAIL", "")
         except Exception:
-            return ""
+            default_email = os.environ.get("NCBI_TOOL_EMAIL", "")
 
-    ncbi_email = st.text_input("NCBI email (opcional)", value=_default_ncbi_email())
-    go = st.button("Processar")
+        ncbi_email = st.text_input("NCBI email (opcional)", value=default_email, key="ncbi_email")
 
+        go = st.form_submit_button("Processar")
+
+# -------------- cache helpers --------------
 @st.cache_data(show_spinner=False)
 def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
@@ -42,10 +62,8 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     try:
         return extract_text_from_pdf_path(temp_path)
     finally:
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
+        try: os.remove(temp_path)
+        except Exception: pass
 
 @st.cache_data(show_spinner=False)
 def _parse_text(text: str):
@@ -56,102 +74,257 @@ def _fetch_tx(nm: str, email: str | None):
     gb = fetch_transcript_gb(nm, email=email)
     return parse_gb_to_transcript(gb)
 
-if go and up is not None:
-    try:
-        if up.type == "application/pdf" or up.name.lower().endswith(".pdf"):
-            text = _extract_text_from_pdf_bytes(up.read())
-        else:
-            text = up.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        st.error(f"Falha ao ler arquivo: {e}")
-        st.stop()
+# -------------- funções de geração de arquivos --------------
+def _build_variants_df(variants: list[Variant]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "gene": v.gene,
+        "transcrito": v.transcript,
+        "HGVS c.": v.hgvs_c,
+        "HGVS p.": v.hgvs_p,
+        "VAF%": v.vaf_pct,
+        "tier": v.tier,
+        "oncogenicidade": v.oncogenicity,
+        "seção": v.section,
+        "notas": ", ".join(v.notes),
+    } for v in variants])
 
-    variants = _parse_text(text)
-    if not variants:
-        st.warning("Nenhuma variante detectada. Verifique o formato do laudo.")
-        st.stop()
+def _group_by_gene(variants: list[Variant]) -> dict[str, list[Variant]]:
+    by_gene: dict[str, list[Variant]] = {}
+    for v in variants:
+        by_gene.setdefault(v.gene, []).append(v)
+    return by_gene
 
-    # Tabela resumida
-    df = pd.DataFrame([
-        {
-            "gene": v.gene,
+def _roi_fasta_header(gene: str, tx: TranscriptSeq | None, hgvs_c: str, roi: int) -> str:
+    acc = tx.accession if tx else "NA"
+    return f">{gene}|{acc}|{hgvs_c}|ROI{roi}"
+
+def _seq_with_linebreaks(s: str, width: int = 60) -> str:
+    return "\n".join(s[i:i+width] for i in range(0, len(s), width))
+
+def _build_html_report(df: pd.DataFrame,
+                       grouped: dict[str, list[Variant]],
+                       tx_by_gene: dict[str, TranscriptSeq],
+                       roi: int) -> str:
+    # CSS simples; <mark> já dá o amarelo
+    css = """
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 0.2rem; }
+    h2 { margin-top: 2rem; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; }
+    th { background: #f4f4f4; text-align: left; }
+    pre { background: #fafafa; padding: 10px; border: 1px solid #eee; overflow-x: auto; }
+    .mut { margin-top: 0.5rem; margin-bottom: 1rem; }
+    .caption { color:#666; font-size: 12px; margin: 0.3rem 0 0.8rem; }
+    </style>
+    """
+    html = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Relatório — Effatha</title>{css}</head><body>"]
+    html.append("<h1>Relatório — Effatha Gene Highlighter</h1>")
+    html.append("<p>Resumo de variantes detectadas e CDS com mutações destacadas.</p>")
+    html.append(df.to_html(index=False, escape=False))
+
+    for gene, vs in grouped.items():
+        html.append(f"<h2>{escape_html(gene)}</h2>")
+        # Tabela por gene
+        gdf = pd.DataFrame([{
+            "seção": v.section,
             "transcrito": v.transcript,
             "HGVS c.": v.hgvs_c,
             "HGVS p.": v.hgvs_p,
             "VAF%": v.vaf_pct,
             "tier": v.tier,
             "oncogenicidade": v.oncogenicity,
-            "seção": v.section,
-        }
-        for v in variants
-    ])
-    st.subheader("Variantes extraídas")
-    st.dataframe(df, use_container_width=True)
+            "notas": ", ".join(v.notes),
+        } for v in vs])
+        html.append(gdf.to_html(index=False, escape=False))
 
-    # Agrupar por gene
-    by_gene = {}
-    for v in variants:
-        by_gene.setdefault(v.gene, []).append(v)
+        tx = tx_by_gene.get(gene)
+        if not tx:
+            continue
 
-    for gene, vs in by_gene.items():
-        st.markdown(f"### {gene}")
-        tx = next((v.transcript for v in vs if v.transcript), None)
-        tx_seq = None
-        if fetch_seq and tx:
+        # WT combinado
+        wt_highs: list[Highlight] = []
+        for v in vs:
+            if v.hgvs_c and v.hgvs_c.startswith("c.") and ("+" not in v.hgvs_c and "-" not in v.hgvs_c):
+                try:
+                    _, h = apply_hgvs_c_to_cds(tx.cds_seq, v.hgvs_c)
+                    wt_highs.extend(h)
+                except Exception:
+                    pass
+        html.append("<div class='mut'><strong>CDS (WT) — destaques combinados</strong></div>")
+        html.append("<pre>" + wrap_seq_with_highlights(tx.cds_seq, wt_highs, line=90) + "</pre>")
+
+        # Por variante (mutada + ROI)
+        for v in vs:
+            if not v.hgvs_c:  # CNV etc.
+                continue
+            html.append(f"<div class='mut'><strong>{escape_html(v.hgvs_c)}</strong></div>")
+            if "+" in v.hgvs_c or "-" in v.hgvs_c:
+                html.append("<div class='caption'>Sem destaque CDS para variantes intrônicas/splice.</div>")
+                continue
             try:
-                tx_seq = _fetch_tx(tx, ncbi_email or None)
-            except Exception as e:
-                st.info(f"Não foi possível obter {tx}: {e}")
+                mut_seq, hlist = apply_hgvs_c_to_cds(tx.cds_seq, v.hgvs_c)
+                html.append("<pre>" + wrap_seq_with_highlights(mut_seq, hlist, line=90) + "</pre>")
+                # ROI
+                if hlist and hlist[0].kind in {"SNV","DEL","INS","DUP"}:
+                    center = hlist[0].start
+                    s = max(1, center - roi); e = min(len(mut_seq), center + roi)
+                    roi_seq = mut_seq[s-1:e]
+                    header = _roi_fasta_header(gene, tx, v.hgvs_c, roi)
+                    fasta_block = f"{header}\n{_seq_with_linebreaks(roi_seq, 60)}"
+                    html.append("<div class='caption'>ROI ±{} nt (FASTA)</div>".format(roi))
+                    html.append("<pre>{}</pre>".format(escape_html(fasta_block)))
+            except Exception as ex:
+                html.append(f"<div class='caption'>Falha ao aplicar {escape_html(v.hgvs_c)}: {escape_html(str(ex))}</div>")
+    html.append("</body></html>")
+    return "\n".join(html)
 
-        # tabela do gene
-        gdf = pd.DataFrame([
-            {
-                "seção": v.section,
-                "transcrito": v.transcript,
-                "HGVS c.": v.hgvs_c,
-                "HGVS p.": v.hgvs_p,
-                "VAF%": v.vaf_pct,
-                "tier": v.tier,
-                "oncogenicidade": v.oncogenicity,
-                "notas": ", ".join(v.notes),
-            } for v in vs
-        ])
+def _build_xlsx_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="variantes", index=False)
+    return output.getvalue()
+
+# -------------- processamento (acionado pelo form) --------------
+def _process_now(upload, roi, fetch_flag, email):
+    # ler bytes e guardar
+    SS.uploaded_name = upload.name
+    SS.uploaded_bytes = upload.read()
+
+    # extrair texto
+    try:
+        if upload.type == "application/pdf" or upload.name.lower().endswith(".pdf"):
+            text = _extract_text_from_pdf_bytes(SS.uploaded_bytes)
+        else:
+            text = SS.uploaded_bytes.decode("utf-8", errors="ignore")
+    except Exception as e:
+        st.error(f"Falha ao ler arquivo: {e}")
+        return
+
+    SS.parsed_text = text
+
+    # parsear variantes
+    variants = _parse_text(text)
+    if not variants:
+        st.warning("Nenhuma variante detectada. Verifique o formato do laudo.")
+        # Mesmo assim limpamos estado de resultados
+        SS.variants = None
+        SS.df_variants = None
+        SS.tx_by_gene = {}
+        SS.html_report = None
+        SS.xlsx_bytes = None
+        SS.processed = False
+        return
+
+    SS.variants = variants
+    SS.df_variants = _build_variants_df(variants)
+    SS.roi_nt = roi
+
+    # agrupar e buscar transcritos
+    grouped = _group_by_gene(variants)
+    tx_by_gene: dict[str, TranscriptSeq] = {}
+    if fetch_flag:
+        for gene, vs in grouped.items():
+            tx = next((v.transcript for v in vs if v.transcript), None)
+            if tx:
+                try:
+                    tx_by_gene[gene] = _fetch_tx(tx, email or None)
+                except Exception as e:
+                    # não bloqueia; apenas informa no corpo da página
+                    st.info(f"Não foi possível obter {tx}: {e}")
+    SS.tx_by_gene = tx_by_gene
+
+    # relatório HTML + XLSX
+    SS.html_report = _build_html_report(SS.df_variants, grouped, SS.tx_by_gene, SS.roi_nt)
+    SS.xlsx_bytes = _build_xlsx_bytes(SS.df_variants)
+
+    SS.processed = True
+
+# Se o usuário clicou em "Processar", processamos agora
+if go and up is not None:
+    _process_now(up, SS.roi_slider, SS.fetch_flag, SS.ncbi_email)
+
+# -------------- renderização dos resultados (de estado) --------------
+if SS.processed and SS.variants:
+    st.subheader("Variantes extraídas")
+    st.dataframe(SS.df_variants, use_container_width=True)
+
+    # botões de download do relatório/html e xlsx (não apagam a tela porque re-renderizamos do estado)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.download_button(
+            "Baixar relatório (HTML com destaques)",
+            data=SS.html_report or "",
+            file_name="relatorio_effatha.html",
+            mime="text/html",
+            key="dl_html_report"
+        )
+    with col_b:
+        st.download_button(
+            "Baixar resumo (XLSX)",
+            data=SS.xlsx_bytes or b"",
+            file_name="variantes_effatha.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_xlsx"
+        )
+
+    # por gene (mostrando também ROI individuais e FASTA — mantive)
+    grouped = _group_by_gene(SS.variants)
+
+    for gene, vs in grouped.items():
+        st.markdown(f"### {gene}")
+        tx = SS.tx_by_gene.get(gene)
+
+        gdf = pd.DataFrame([{
+            "seção": v.section,
+            "transcrito": v.transcript,
+            "HGVS c.": v.hgvs_c,
+            "HGVS p.": v.hgvs_p,
+            "VAF%": v.vaf_pct,
+            "tier": v.tier,
+            "oncogenicidade": v.oncogenicity,
+            "notas": ", ".join(v.notes),
+        } for v in vs])
         st.dataframe(gdf, use_container_width=True)
 
-        if tx_seq:
-            # Destaques na WT
-            wt_highs = []
+        if tx:
+            # WT combinado
+            wt_highs: list[Highlight] = []
             for v in vs:
                 if v.hgvs_c and v.hgvs_c.startswith("c.") and ("+" not in v.hgvs_c and "-" not in v.hgvs_c):
                     try:
-                        _, h = apply_hgvs_c_to_cds(tx_seq.cds_seq, v.hgvs_c)
+                        _, h = apply_hgvs_c_to_cds(tx.cds_seq, v.hgvs_c)
                         wt_highs.extend(h)
                     except Exception:
                         pass
             st.markdown("**CDS (WT) — destaques combinados**")
-            st.markdown("<pre>" + wrap_seq_with_highlights(tx_seq.cds_seq, wt_highs, line=90) + "</pre>", unsafe_allow_html=True)
+            st.markdown("<pre>" + wrap_seq_with_highlights(tx.cds_seq, wt_highs, line=90) + "</pre>", unsafe_allow_html=True)
 
             # Por variante
             with st.expander("Ver por variante (mutada + ROI)", expanded=False):
-                for v in vs:
+                for idx, v in enumerate(vs):
                     if not v.hgvs_c:
                         continue
                     st.markdown(f"#### {escape_html(v.hgvs_c)}", unsafe_allow_html=True)
-                    if "+" in (v.hgvs_c or "") or "-" in (v.hgvs_c or ""):
+                    if "+" in v.hgvs_c or "-" in v.hgvs_c:
                         st.caption("Sem destaque CDS para variantes intrônicas/splice.")
                         continue
                     try:
-                        mut_seq, hlist = apply_hgvs_c_to_cds(tx_seq.cds_seq, v.hgvs_c)
+                        mut_seq, hlist = apply_hgvs_c_to_cds(tx.cds_seq, v.hgvs_c)
                         st.markdown("<pre>" + wrap_seq_with_highlights(mut_seq, hlist, line=90) + "</pre>", unsafe_allow_html=True)
+
                         if hlist and hlist[0].kind in {"SNV","DEL","INS","DUP"}:
                             center = hlist[0].start
-                            s = max(1, center - roi); e = min(len(mut_seq), center + roi)
+                            s = max(1, center - SS.roi_nt); e = min(len(mut_seq), center + SS.roi_nt)
                             roi_seq = mut_seq[s-1:e]
+
                             st.download_button(
-                                label=f"Baixar ROI ±{roi} nt ({v.hgvs_c})",
-                                data=f">{gene}|{tx_seq.accession}|{v.hgvs_c}|ROI{roi}\n" + "\n".join(roi_seq[i:i+60] for i in range(0, len(roi_seq), 60)),
-                                file_name=f"{gene}_{tx_seq.accession}_{v.hgvs_c}_ROI{roi}.fasta",
+                                label=f"Baixar ROI ±{SS.roi_nt} nt ({v.hgvs_c})",
+                                data=_roi_fasta_header(gene, tx, v.hgvs_c, SS.roi_nt) + "\n" + _seq_with_linebreaks(roi_seq, 60),
+                                file_name=f"{gene}_{tx.accession}_{v.hgvs_c}_ROI{SS.roi_nt}.fasta",
                                 mime="text/plain",
+                                key=f"dl_roi_{gene}_{idx}"
                             )
                     except Exception as e:
                         st.warning(f"Falha ao aplicar {v.hgvs_c}: {e}")

@@ -20,7 +20,8 @@ def _init_state():
     SS.setdefault("uploaded_bytes", None)
     SS.setdefault("parsed_text", None)
     SS.setdefault("variants", None)            # list[Variant]
-    SS.setdefault("df_variants", None)         # pd.DataFrame
+    SS.setdefault("df_variants", None)         # pd.DataFrame (sem HTML)
+    SS.setdefault("df_variants_html", None)    # pd.DataFrame (HGVS c. com <mark>)
     SS.setdefault("tx_by_gene", {})            # dict[str, TranscriptSeq]
     SS.setdefault("roi_left", 90)              # nt antes
     SS.setdefault("roi_right", 90)             # nt depois
@@ -51,7 +52,7 @@ with st.sidebar:
             help="Usa eutils para obter NM_* e destacar mutações na CDS", key="fetch_flag"
         )
 
-        # Preferir env. Se não houver secrets, não quebra.
+        # Preferir env; se não houver secrets, não quebra.
         try:
             default_email = st.secrets.get("NCBI_TOOL_EMAIL", "")
         except Exception:
@@ -145,6 +146,50 @@ def _group_by_gene(variants: list[Variant]) -> dict[str, list[Variant]]:
         by_gene.setdefault(v.gene, []).append(v)
     return by_gene
 
+# ---- NOVO: destacar nt na coluna HGVS c. (HTML) ----
+_cell_snv = re.compile(r"^c\.(?P<pos>\d+(?:[+-]\d+)?)(?P<ref>[ACGT])>(?P<alt>[ACGT])$", re.IGNORECASE)
+_cell_del = re.compile(r"^c\.(?P<s>\d+)_(?P<e>\d+)del(?P<seq>[ACGT]*)$", re.IGNORECASE)
+_cell_ins = re.compile(r"^c\.(?P<s>\d+)_(?P<e>\d+)ins(?P<seq>[ACGT]+)$", re.IGNORECASE)
+_cell_dup = re.compile(r"^c\.(?P<pos>\d+)dup(?P<seq>[ACGT]*)$", re.IGNORECASE)
+
+def _mark_hgvs_c_html(hgvs: str | None) -> str:
+    """Retorna HGVS c. com <mark> no trecho alterado, em HTML (escape seguro)."""
+    if not hgvs:
+        return "-"
+    s = hgvs.strip()
+
+    m = _cell_snv.match(s)  # inclui intrônica (pos com + ou -)
+    if m:
+        pos = escape_html(m.group("pos"))
+        ref = escape_html(m.group("ref"))
+        alt = escape_html(m.group("alt"))
+        return f"c.{pos}<mark>{ref}</mark>&gt;<mark>{alt}</mark>"
+
+    m = _cell_del.match(s)
+    if m:
+        a = escape_html(m.group("s")); b = escape_html(m.group("e"))
+        seq = m.group("seq")
+        if seq:
+            return f"c.{a}_{b}del<mark>{escape_html(seq)}</mark>"
+        return f"c.{a}_{b}<mark>del</mark>"
+
+    m = _cell_ins.match(s)
+    if m:
+        a = escape_html(m.group("s")); b = escape_html(m.group("e"))
+        seq = escape_html(m.group("seq"))
+        return f"c.{a}_{b}ins<mark>{seq}</mark>"
+
+    m = _cell_dup.match(s)
+    if m:
+        pos = escape_html(m.group("pos"))
+        seq = m.group("seq")
+        if seq:
+            return f"c.{pos}dup<mark>{escape_html(seq)}</mark>"
+        return f"c.{pos}<mark>dup</mark>"
+
+    # fallback: só escapa
+    return escape_html(s)
+
 def _build_variants_df(variants: list[Variant],
                        tx_by_gene: dict[str, TranscriptSeq],
                        left: int, right: int) -> pd.DataFrame:
@@ -167,7 +212,15 @@ def _build_variants_df(variants: list[Variant],
         })
     return pd.DataFrame(rows)
 
-def _build_html_report(df: pd.DataFrame,
+def _build_variants_df_html(df_plain: pd.DataFrame) -> pd.DataFrame:
+    """Copia do DF com 'HGVS c.' contendo HTML com <mark> para uso no front (HTML) e relatório."""
+    df = df_plain.copy()
+    col = "HGVS c."
+    if col in df.columns:
+        df[col] = [ _mark_hgvs_c_html(x) for x in df[col].tolist() ]
+    return df
+
+def _build_html_report(df_html: pd.DataFrame,
                        grouped: dict[str, list[Variant]],
                        tx_by_gene: dict[str, TranscriptSeq],
                        left: int, right: int) -> str:
@@ -182,20 +235,21 @@ def _build_html_report(df: pd.DataFrame,
     pre { background: #fafafa; padding: 10px; border: 1px solid #eee; overflow-x: auto; }
     .mut { margin-top: 0.5rem; margin-bottom: 1rem; }
     .caption { color:#666; font-size: 12px; margin: 0.3rem 0 0.8rem; }
+    mark { background: #fffd80; }
     </style>
     """
     html = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Relatório — Effatha</title>{css}</head><body>"]
     html.append("<h1>Relatório — Effatha Gene Highlighter</h1>")
     html.append("<p>Resumo de variantes detectadas e CDS com mutações destacadas.</p>")
-    html.append(df.to_html(index=False, escape=False))
+    html.append(df_html.to_html(index=False, escape=False))
 
     for gene, vs in grouped.items():
         html.append(f"<h2>{escape_html(gene)}</h2>")
-        # Tabela por gene
+        # Tabela por gene (sem destaque aqui, foco na coluna já destacada acima)
         gdf = pd.DataFrame([{
             "seção": v.section,
             "transcrito": v.transcript,
-            "HGVS c.": v.hgvs_c,
+            "HGVS c.": _mark_hgvs_c_html(v.hgvs_c),
             "HGVS p.": v.hgvs_p,
             "VAF%": v.vaf_pct,
             "tier": v.tier,
@@ -224,7 +278,7 @@ def _build_html_report(df: pd.DataFrame,
         for v in vs:
             if not v.hgvs_c:
                 continue
-            html.append(f"<div class='mut'><strong>{escape_html(v.hgvs_c)}</strong></div>")
+            html.append(f"<div class='mut'><strong>{_mark_hgvs_c_html(v.hgvs_c)}</strong></div>")
             if "+" in v.hgvs_c or "-" in v.hgvs_c:
                 html.append("<div class='caption'>Sem destaque CDS para variantes intrônicas/splice.</div>")
                 continue
@@ -235,8 +289,8 @@ def _build_html_report(df: pd.DataFrame,
                     center = hlist[0].start
                     s = max(1, center - left); e = min(len(mut_seq), center + right)
                     roi_seq = mut_seq[s-1:e]
-                    header = _roi_fasta_header(gene, tx, v.hgvs_c, left, right)
-                    fasta_block = f"{header}\n{_seq_with_linebreaks(roi_seq, 60)}"
+                    header = f">{gene}|{tx.accession}|{v.hgvs_c}|ROI-L{left}_R{right}"
+                    fasta_block = f"{header}\n" + "\n".join(roi_seq[i:i+60] for i in range(0, len(roi_seq), 60))
                     html.append(f"<div class='caption'>ROI −{left}/+{right} nt (FASTA)</div>")
                     html.append("<pre>{}</pre>".format(escape_html(fasta_block)))
             except Exception as ex:
@@ -244,19 +298,20 @@ def _build_html_report(df: pd.DataFrame,
     html.append("</body></html>")
     return "\n".join(html)
 
-def _build_xlsx_bytes(df: pd.DataFrame) -> bytes:
+def _build_xlsx_bytes(df_plain: pd.DataFrame) -> bytes:
+    """Gera XLSX sem HTML na coluna HGVS (mantemos a versão 'limpa' para Excel)."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         sheet = "variantes"
-        df.to_excel(writer, sheet_name=sheet, index=False)
+        df_plain.to_excel(writer, sheet_name=sheet, index=False)
         wb = writer.book
         ws = writer.sheets[sheet]
         fmt_header = wb.add_format({"bold": True, "bg_color": "#F4F4F4", "border": 1})
         ws.set_row(0, 18, fmt_header)
         ws.freeze_panes(1, 0)
-        ws.autofilter(0, 0, len(df), len(df.columns)-1)
+        ws.autofilter(0, 0, len(df_plain), len(df_plain.columns)-1)
         # larguras básicas
-        for col_idx, col_name in enumerate(df.columns):
+        for col_idx, col_name in enumerate(df_plain.columns):
             width = 12
             if col_name in ("transcrito", "HGVS c.", "HGVS p."): width = 20
             if "ROI" in col_name: width = 60
@@ -289,6 +344,7 @@ def _process_now(upload, left: int, right: int, fetch_flag: bool, email: str | N
         st.warning("Nenhuma variante detectada. Verifique o formato do laudo.")
         SS.variants = None
         SS.df_variants = None
+        SS.df_variants_html = None
         SS.tx_by_gene = {}
         SS.html_report = None
         SS.xlsx_bytes = None
@@ -312,11 +368,15 @@ def _process_now(upload, left: int, right: int, fetch_flag: bool, email: str | N
                     st.info(f"Não foi possível obter {tx}: {e}")
     SS.tx_by_gene = tx_by_gene
 
-    # DF (já com ROI WT/MUT)
-    SS.df_variants = _build_variants_df(variants, SS.tx_by_gene, SS.roi_left, SS.roi_right)
+    # DF "limpo" e DF com HGVS marcado
+    df_plain = _build_variants_df(variants, SS.tx_by_gene, SS.roi_left, SS.roi_right)
+    df_html = _build_variants_df_html(df_plain)
 
-    # relatório HTML + XLSX
-    SS.html_report = _build_html_report(SS.df_variants, grouped, SS.tx_by_gene, SS.roi_left, SS.roi_right)
+    SS.df_variants = df_plain
+    SS.df_variants_html = df_html
+
+    # relatório HTML usa a versão com destaque; XLSX usa a versão limpa
+    SS.html_report = _build_html_report(SS.df_variants_html, grouped, SS.tx_by_gene, SS.roi_left, SS.roi_right)
     SS.xlsx_bytes = _build_xlsx_bytes(SS.df_variants)
 
     SS.processed = True
@@ -328,7 +388,13 @@ if go and up is not None:
 # -------------- renderização --------------
 if SS.processed and SS.variants is not None:
     st.subheader("Variantes extraídas")
+
+    # Tabela interativa (sem HTML)
     st.dataframe(SS.df_variants, use_container_width=True)
+
+    # Tabela com destaque (HTML)
+    st.markdown("**Tabela com destaque do nt (HGVS c.)**")
+    st.markdown(SS.df_variants_html.to_html(index=False, escape=False), unsafe_allow_html=True)
 
     # downloads do relatório/xlsx
     col_a, col_b = st.columns(2)
@@ -356,7 +422,8 @@ if SS.processed and SS.variants is not None:
         st.markdown(f"### {gene}")
         tx = SS.tx_by_gene.get(gene)
 
-        gdf = pd.DataFrame([{
+        # Tabela do gene — com destaque na coluna HGVS c.
+        gdf_plain = pd.DataFrame([{
             "seção": v.section,
             "transcrito": v.transcript,
             "HGVS c.": v.hgvs_c,
@@ -366,7 +433,12 @@ if SS.processed and SS.variants is not None:
             "oncogenicidade": v.oncogenicity,
             "notas": ", ".join(v.notes),
         } for v in vs])
-        st.dataframe(gdf, use_container_width=True)
+        gdf_html = gdf_plain.copy()
+        if "HGVS c." in gdf_html.columns:
+            gdf_html["HGVS c."] = [ _mark_hgvs_c_html(x) for x in gdf_html["HGVS c."].tolist() ]
+
+        st.dataframe(gdf_plain, use_container_width=True)
+        st.markdown(gdf_html.to_html(index=False, escape=False), unsafe_allow_html=True)
 
         if tx:
             # WT combinado
@@ -386,7 +458,7 @@ if SS.processed and SS.variants is not None:
                 for idx, v in enumerate(vs):
                     if not v.hgvs_c:
                         continue
-                    st.markdown(f"#### {escape_html(v.hgvs_c)}", unsafe_allow_html=True)
+                    st.markdown(f"#### {_mark_hgvs_c_html(v.hgvs_c)}", unsafe_allow_html=True)
                     if "+" in v.hgvs_c or "-" in v.hgvs_c:
                         st.caption("Sem destaque CDS para variantes intrônicas/splice.")
                         continue
